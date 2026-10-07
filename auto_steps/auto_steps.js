@@ -3,10 +3,9 @@
 // (阶段 Toast 提示 + 状态记录 + Shizuku 清理最近任务 + 通知播报)
 // 运行环境：AutoJs6
 // 前置条件：开启无障碍服务；授权 Shizuku（不可用时自动退回到多任务手势清理）
+// 定时运行：定时任务指向同目录的 remind.js，它负责响铃并发通知，点击通知后才运行本脚本。
+//           本脚本被启动就直接执行，不区分启动方式
 // ==========================================
-
-// 确保无障碍服务已开启，未开启时会跳转设置页并等待
-auto.waitFor();
 
 // ====== 配置 ======
 // 用包名启动 App，不受系统语言影响（App 名称会随语言变化，如 微信 / WeChat）
@@ -21,6 +20,8 @@ var MP_MIN_CENTER_Y = 300;       // 过滤顶部搜索栏等区域的像素阈�
 var REWARD_BTN_TEXT = null;      // 领奖按钮文字（如 "领取"），填写后优先按文字点击
 var REWARD_OFFSET_Y = 208;       // 未填按钮文字时，"今日步数" 下方的像素偏移，换机需重测
 var REPORT_TITLE = "【今日打卡报告】";
+var REMIND_SCRIPT = "remind.js";          // 同目录的提醒脚本，锁屏无法执行时用它重新发提醒通知
+var REMINDER_NOTICE_ID = 22000;           // remind.js 发出的提醒通知 ID，需与 remind.js 保持一致
 
 // 界面文字：系统语言会在中英文间切换，每项列出所有可能的写法，App 改翻译时在这里补充
 var TEXT_SUBMIT = ["提交", "Submit"];                       // 步数能手的提交按钮
@@ -61,6 +62,12 @@ function sendNotice(title, content) {
     } catch (e) {
         log("发送通知失败：" + e);
     }
+}
+
+// 判断手机是否处于可操作状态：屏幕亮着且没有锁屏
+function isDeviceUnlocked() {
+    var km = context.getSystemService(android.content.Context.KEYGUARD_SERVICE);
+    return device.isScreenOn() && !km.isKeyguardLocked();
 }
 
 // ====== 通用工具 ======
@@ -318,6 +325,21 @@ function reportStage(line) {
     runStatus.push(line);
     showToast(line);
 }
+
+// ====== 前置检查 ======
+// 锁屏时无法操作界面，交给 remind.js 重新发提醒通知后退出
+if (!isDeviceUnlocked()) {
+    log("手机已锁屏，重新发送提醒通知后退出");
+    engines.execScriptFile(files.path("./" + REMIND_SCRIPT), {
+        arguments: { message: "手机已锁屏，解锁后点击此通知开始执行今日打卡" },
+    });
+    exit();
+}
+// 正常执行时清除之前留下的提醒通知（例如用户没点通知、直接手动运行了脚本）
+notice.cancel(REMINDER_NOTICE_ID);
+
+// 确保无障碍服务已开启，未开启时会跳转设置页并等待
+auto.waitFor();
 
 // ====== 第一阶段：步数能手任务 ======
 var stepsPkg = STEPS_PKG;

@@ -78,19 +78,43 @@
   - 能看到底部的"通讯录"标签：在首页，执行下拉；
   - 都看不到：在子页面，按一次返回键。按返回键退出了微信就重新打开。
 
+### 10. 定时任务触发时不直接执行，改为响铃并等用户点击通知
+
+- **背景**：无障碍操作需要屏幕亮着且已解锁。手机设置了锁屏密码时，脚本无法安全地自动解锁：自动输入 PIN 码需要把密码明文写进脚本，而仓库是公开的。即使到点时手机正好解锁着，用户可能正在用手机，直接接管屏幕也不合适。
+- **做法：把提醒和执行拆成两个脚本**
+  - 定时任务指向 `remind.js`，它只发一条会响铃的通知，点击通知后运行 `auto_steps.js`；
+  - `auto_steps.js` 被启动就直接执行，不区分启动方式。
+- **为什么不在同一个脚本里区分启动方式**：
+  - 技术上可行。AutoJs6 所有的定时任务（AlarmManager、WorkManager、JobScheduler 三种方式）都通过 `TimedTask.createIntent()` 生成启动 intent，里面一定带有 `task_id` 参数，脚本中用 `engines.myEngine().execArgv.intent` 就能取到。
+  - 但 `task_id` 是 AutoJs6 内部的实现细节，文档里没有写，以后的版本改了，判断就会失效，定时触发时会直接执行打卡。拆成两个脚本，就不依赖这个细节了。
+- **点击通知运行脚本的实现**：
+  - `notice()` 的 `intent` 选项可以直接传 Android `Intent` 对象。AutoJs6 把它包装成 `PendingIntent.getActivity`，所以在锁屏界面点击通知，系统会先要求解锁。
+  - Intent 的目标设为 AutoJs6 对外开放的 `org.autojs.autojs.external.open.RunIntentActivity`，extra `path` 填脚本的绝对路径，AutoJs6 收到后就会运行这个脚本。
+- **脚本之间互相调用**：`engines.execScriptFile(path, { arguments: {...} })` 可以启动另一个脚本，被启动的脚本通过 `engines.myEngine().execArgv` 读取参数，工作目录默认沿用调用方的。
+- **响铃**：通知所在渠道的重要性要设为 `IMPORTANCE_HIGH`，通知才会发出提示音并弹出横幅。Android 规定渠道创建后，App 不能再提高它的重要性，以系统设置里的渠道配置为准，改代码不会生效。
+- **不能用 `notice.channel.create()`**：AutoJs6 文档里有这个接口，但在 v6.7.0 中调用会报 `TypeError: Cannot find function create`。原因是 `Channel` 类实现了 `create()`，却没有像 `Notice` 那样声明 `selfAssignmentFunctions`，函数没有暴露给脚本。改为直接调用 Android 的 `NotificationManager.createNotificationChannel()` 创建渠道；之后 `notice()` 发到这个渠道时，AutoJs6 只在渠道不存在时才创建（`Channel.createIfNeeded`），不会覆盖。
+- **注意**：从编辑器运行脚本时，实际执行的是缓存目录里的临时副本（日志中显示为 `[cache]`），所以脚本路径要用 `files.path("./<文件名>")` 基于工作目录生成，不能取当前正在执行的文件路径。
+- **依据**：AutoJs6 v6.7.0 源码 `augment/notice/Channel.kt`、`timing/TimedTask.java`（`createIntent`）、`external/ScriptIntents.kt`、`augment/engines/Engines.kt`（`execArgv`、`execScriptFile`）、`augment/notice/Notice.kt`、`util/NotificationUtils.kt`、`external/open/RunIntentActivity.java`；AutoJs6 文档 NoticeChannelOptions。
+
+### 11. 定时任务的触发方式和需要的权限
+
+- AutoJs6 的定时任务默认用 AlarmManager 精确闹钟（`setExactAndAllowWhileIdle`）。要授予"闹钟和提醒"权限，才能在熄屏或待机时准时触发。设置里也可以改成 WorkManager 或 JobScheduler，但这两种都可能被系统推迟。
+- 脚本里也可以用 `tasks.addDailyTask({ path, time: "22:00" })` 注册定时任务。官方文档的"任务"一章还没写，接口要看源码 `augment/tasks/Tasks.kt`。
+- **依据**：AutoJs6 源码 `timing/AlarmTimedTaskScheduler.kt`、`res/values/strings.xml`（`default_key_timed_task_backend`）。
+
 ---
 
 ## 三、最近任务清理（Shizuku）
 
 AutoJs6 支持 Shizuku。确认 Shizuku 可用后，可以用 `shizuku(cmd)` 执行 shell 命令，做到普通 App 做不到的事。下面几条都基于这个能力。
 
-### 10. `am force-stop` 不会把卡片从最近任务里移除
+### 12. `am force-stop` 不会把卡片从最近任务里移除
 
 - 它只结束进程。手动上滑卡片之所以能同时做到"移除卡片 + 结束进程"，是因为调用了系统的 `removeTask`。
 - **解决**：用 Shizuku 执行 `dumpsys activity recents` 找到任务 ID，再执行 `am stack remove <taskId>`。这条命令调用的就是 `ActivityTaskManager.removeTask`，效果等同手动上滑。
 - **依据**：AOSP `android15-release` 和 `main` 分支的 `ActivityManagerShellCommand.java`（`runRootTaskRemove`）。
 
-### 11. `dumpsys` 输出是给人看的纯文本，格式不稳定
+### 13. `dumpsys` 输出是给人看的纯文本，格式不稳定
 
 - 每张卡片的标题行格式是 `* Recent #0: Task{<hash> #<taskId> type=standard A=<uid>:<affinity>}`（或 `I=<component>`）。
 - Android 15 中，任务对应的界面组件字段是 **`mActivityComponent=`**，**不是** `realActivity=`。我一开始按旧印象写成 `realActivity=`，核对源码后才改正。
@@ -99,19 +123,19 @@ AutoJs6 支持 Shizuku。确认 Shizuku 可用后，可以用 `shizuku(cmd)` 执
 - 解析时同时匹配好几种标记；如果系统升级后日志出现"改用手势清理"，多半是输出格式变了。
 - **依据**：AOSP `RecentTasks.dump()`、`Task.toString()`、`Task.dump()`。
 
-### 12. 微信小程序和微信共用包名
+### 14. 微信小程序和微信共用包名
 
 - 小程序运行在 `com.tencent.mm` 包内，有单独的卡片，组件名是 `com.tencent.mm/.plugin.appbrand.ui.AppBrandUI`（多开时带编号，如 `AppBrandUI1`）。
 - 按包名清理会把微信主界面一起移除，还会把微信结束掉。
 - **解决**：只移除**最近使用的那一个** `AppBrandUI*` 任务（`closeMiniProgram()`），**不对微信执行 force-stop**。
 
-### 13. Shizuku 的返回值在 AutoJs6 和 AutoX v7 中不同
+### 15. Shizuku 的返回值在 AutoJs6 和 AutoX v7 中不同
 
 - AutoJs6：`shizuku(cmd)` 返回 `{ code, result, error }`。
 - AutoX v7：返回底层 `runShizukuShellCommand` 的结果，具体结构未验证。
 - 已封装在 `shellRun()` 里，迁移时只改这一处。
 
-### 14. 兜底手势依赖 OnePlus 的最近任务界面布局
+### 16. 兜底手势依赖 OnePlus 的最近任务界面布局
 
 - 当前 App 在前台时打开最近任务：当前 App 的卡片露在屏幕右侧，大约从 72% 宽度开始；从桌面打开时，最新的卡片居中。
 - 所以兜底手势在 **4/5 屏幕宽度**处上滑，两种布局下都能滑到目标卡片。换机或换桌面程序后需要重新确认。
@@ -120,12 +144,12 @@ AutoJs6 支持 Shizuku。确认 Shizuku 可用后，可以用 `shizuku(cmd)` 执
 
 ## 四、业务相关
 
-### 15. 步数能手提交后，以弹窗 JSON 判断是否成功
+### 17. 步数能手提交后，以弹窗 JSON 判断是否成功
 
 - 弹窗内容形如 `{"code":"1","time":"...","user":"...","step":13502,"status":"success","message":"修改步数（13502）"}`。
 - 要求 `status === "success"`，并且 `step` 等于本次填写的步数，才算成功。JSON 解析失败时，退回到检查文字里有没有 `success`。
 
-### 16. 写死的像素值只适用于当前设备
+### 18. 写死的像素值只适用于当前设备
 
 - `MP_MIN_CENTER_Y = 300`、`REWARD_OFFSET_Y = 208` 都是在 OnePlus 13T 上测出来的，换机后需要重新测。
 - 能按文字找到的按钮，优先按文字找（`REWARD_BTN_TEXT`）。
@@ -137,11 +161,13 @@ AutoJs6 支持 Shizuku。确认 Shizuku 可用后，可以用 `shizuku(cmd)` 执
 - **AutoX.js**：原仓库 kkevsekk1/AutoX 已于 2025-01-07 停止维护。社区版 v6 最后发布于 2025-03。aiselp/AutoX（v7）仍在活跃更新。
 - **AutoJs6**：单人维护，习惯本地开发很久再集中发大版本（v6.7.0 发布于 2026-03-14，作者 2026-09 在 issue 中提到 v6.8.0 正在开发）。主仓库长时间没有提交，**不代表停止维护**。
 - **选择 AutoJs6 的目的就是用上它的新能力**（扩展 API、Shizuku、插件等），不必为了将来可能的迁移而只用经典 Auto.js API。
-- 如果将来要迁移到 AutoX v7：它的 Rhino 引擎沿用 AutoX v6 的 API，经典 API 部分基本兼容；用到的 AutoJs6 独有能力需要逐个替换，`shizuku()` 的返回值结构也不同（见第 13 条）。
+- 如果将来要迁移到 AutoX v7：它的 Rhino 引擎沿用 AutoX v6 的 API，经典 API 部分基本兼容；用到的 AutoJs6 独有能力需要逐个替换，`shizuku()` 的返回值结构也不同（见第 15 条）。
 
 ## 查证方法
 
 遇到和 AutoJs6 或 Android 系统行为相关的疑问时，直接读源码，不要凭记忆下结论：
+
+- **AutoJs6 的文档不等于实际可用的接口**。文档版本（6.6.4）落后于发行版，而且写在文档里的接口不一定真的暴露给了脚本（例如 `notice.channel.create`，见第 10 条）。使用文档里的接口前，到**用户所装版本的发行版 tag** 源码中确认：对应的 `augment/**/<模块>.kt` 有没有把这个函数列进 `selfAssignmentFunctions`（或 `selfAssignmentGetters` 等）。
 
 - AutoJs6 源码：`gh api repos/SuperMonster003/AutoJs6/contents/<path>`。文档的 HTML 源文件在 `app/src/main/assets-app/docs/`。
 - AOSP 源码：`gh api -H "Accept: application/vnd.github.raw" "repos/aosp-mirror/platform_frameworks_base/contents/<path>?ref=android15-release"`。
