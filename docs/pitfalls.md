@@ -2,7 +2,7 @@
 
 开发 `auto_steps.js` 过程中实际遇到并验证过的问题。每条按「现象 → 原因 → 解决」记录，并注明依据，方便判断结论是否仍然成立。
 
-测试设备：OnePlus 13T（ColorOS），无 root，有 Shizuku，系统语言会在中英文之间切换。
+测试设备：OnePlus 13T（ColorOS），无 root，有 Shizuku。
 
 ---
 
@@ -23,15 +23,17 @@
 ### 3. Android 12+ 后台 toast 频率限制（最隐蔽）
 
 - **现象**：toast 已经限制为每阶段一条，最后的汇总 toast 仍然不显示。
-- **原因**：系统 `NotificationManagerService` 对**不在前台的 App** 限制 toast 频率，超出的直接丢弃：
+- **原因**：从 **Android 12（API 31）** 开始，系统 `NotificationManagerService` 对**不在前台的 App** 限制 toast 频率，超出的直接丢弃。限额是多个滑动时间窗口，按 App 计数，必须同时满足：
   - 20 秒内最多 3 条
   - 42 秒内最多 5 条
   - 68 秒内最多 6 条
 
-  脚本运行时 AutoJs6 处在后台，受这个限制。
-- **解决**：每次运行最多弹 3 条 toast（当前是：步数结果、打卡结果、最终报告）。重要结果同时用**系统通知** `notice()` 发一份，通知不受这个限制。
-- **测试注意**：两次运行之间要间隔 **68 秒以上**，否则两次的 toast 会合并计数，导致被丢弃。
-- **依据**：AOSP `android15-release` 中 `NotificationManagerService.java` 的 `TOAST_RATE_LIMITS`。
+  前台 App 不受这个限制。脚本运行时，前台通常是被操作的 App，AutoJs6 处在后台，所以受限。当时的日志里，前 3 条阶段 toast 在约 10 秒内弹出，第 4 条汇总 toast 超出了"20 秒 3 条"的限额。
+- **解决**：
+  - 根据脚本的运行时长估算 toast 数量，不要超出上面的限额。`auto_steps.js` 全程约 15 秒，所以只弹 3 条：步数结果、打卡结果、最终报告。
+  - 重要结果同时用**系统通知** `notice()` 发一份，通知不受这个限制。
+- **测试注意**：限额按滑动时间窗口计算，**相邻几次运行的 toast 会合并计数**。比如每次运行弹 3 条，两次运行间隔不到 68 秒，就会超出"68 秒 6 条"的限额（之前的条数加上本次的条数），后一次的 toast 可能被丢掉。
+- **依据**：AOSP 源码 `NotificationManagerService.java` 中的 `TOAST_RATE_LIMITS`（`android11-release` 中没有，`android12-release` 起才有），以及 `tryShowToast()` 里的 `isPackageInForeground` 判断。
 
 ### 4. ColorOS / MIUI / OriginOS 需要"后台弹出界面"权限
 
@@ -56,28 +58,31 @@
 - **原因**：收起的面板、滚出屏幕的列表项仍然在无障碍控件树里，`find()` / `findOne()` 照样能找到，但它们的 `bounds()` 在屏幕外。AutoJs6 的 `click(x, y)` 遇到负坐标会直接抛异常。
 - **解决**：点击前用 `isOnScreen()` 检查控件中心是否在屏幕范围内（见 `findVisibleByText()`）。
 
-### 7. `find()` 返回的不是 JS 数组
+### 7. `find()` 的返回值在 AutoJs6 中是真正的 JS 数组
 
-- `UiObjectCollection` 只有 `.length` 和下标访问，**没有** `concat`、`map` 等数组方法。需要合并多个结果时，用嵌套循环遍历。
+- 在 AutoJs6 中，`UiObjectCollection` 交给脚本时会被包装成 JS 数组，所以 `concat`、`map`、`filter` 等数组方法都能用，同时还保留 `click()`、`each()` 等控件集合方法。
+- `auto_steps.js` 里合并查找结果时用的是嵌套循环。这是当时没核实、出于谨慎的写法，不是必须的。
+- 其他 Auto.js 系平台未必这样包装，迁移时需要重新确认。
+- **依据**：AutoJs6 源码 `rhino/AndroidContextFactory.kt`（`wrap()`）、`runtime/ScriptBridges.kt`（`asArray()`）。
 
-### 8. 系统语言切换会改变 App 名称和界面文字
+### 8. App 名称会随系统语言变化
 
-- **App 名称**：微信在中文系统下叫"微信"，英文下叫"WeChat"，界面里显示为"Weixin"。用 `app.launchApp("WeChat")` 在中文系统下会失败。**一律用包名启动**：`app.launch("com.tencent.mm")`。
-- **界面文字**：微信首页底部标签"通讯录"在英文下是"Contacts"。所有按文字查找的地方都用数组列出各种写法，集中放在脚本顶部的配置区（`TEXT_*`）。
-- **例外**：微信小程序面板的"搜索小程序"在英文系统下**仍然显示中文**（截至 2026-10）；`"Search Mini Programs"` 是为将来补翻译准备的**猜测值，未验证**。
-- 小程序名称、小程序页面内容、步数能手的界面都不随系统语言变化。
+- 微信在中文系统下叫"微信"，英文系统下叫"WeChat"，界面里显示为"Weixin"。用 `app.launchApp("WeChat")` 在中文系统下会找不到微信。
+- **解决**：用包名启动，`app.launch("com.tencent.mm")`。
 
 ### 9. 不再强制停止微信后，微信打开时停在上次离开的界面
 
 - 以前每次运行结束都会强制停止微信，下次打开总是停在聊天列表，下拉一定能拉出小程序面板。改为保留微信后，打开时可能停在子页面、面板半开等状态。
 - **解决**：`openMpDrawer()` 先判断当前状态再操作，最多尝试 3 次：
   - 能看到"搜索小程序"：面板已展开；
-  - 能看到"通讯录 / Contacts"：在首页，执行下拉；
+  - 能看到底部的"通讯录"标签：在首页，执行下拉；
   - 都看不到：在子页面，按一次返回键。按返回键退出了微信就重新打开。
 
 ---
 
 ## 三、最近任务清理（Shizuku）
+
+AutoJs6 支持 Shizuku。确认 Shizuku 可用后，可以用 `shizuku(cmd)` 执行 shell 命令，做到普通 App 做不到的事。下面几条都基于这个能力。
 
 ### 10. `am force-stop` 不会把卡片从最近任务里移除
 
@@ -131,7 +136,8 @@
 
 - **AutoX.js**：原仓库 kkevsekk1/AutoX 已于 2025-01-07 停止维护。社区版 v6 最后发布于 2025-03。aiselp/AutoX（v7）仍在活跃更新。
 - **AutoJs6**：单人维护，习惯本地开发很久再集中发大版本（v6.7.0 发布于 2026-03-14，作者 2026-09 在 issue 中提到 v6.8.0 正在开发）。主仓库长时间没有提交，**不代表停止维护**。
-- **迁移策略**：只用经典 Auto.js API，不用 AutoJs6 独有的扩展（`pickup`、`detect`、插件等）。平台相关代码集中放在脚本开头的"平台相关代码"区（`shellRun`、`showToast`、`sendNotice`）。AutoX v7 的 Rhino 引擎沿用 v6 API，迁移成本低。
+- **选择 AutoJs6 的目的就是用上它的新能力**（扩展 API、Shizuku、插件等），不必为了将来可能的迁移而只用经典 Auto.js API。
+- 如果将来要迁移到 AutoX v7：它的 Rhino 引擎沿用 AutoX v6 的 API，经典 API 部分基本兼容；用到的 AutoJs6 独有能力需要逐个替换，`shizuku()` 的返回值结构也不同（见第 13 条）。
 
 ## 查证方法
 
