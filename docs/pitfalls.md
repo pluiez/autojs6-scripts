@@ -144,15 +144,26 @@ AutoJs6 支持 Shizuku。确认 Shizuku 可用后，可以用 `shizuku(cmd)` 执
 
 ## 四、业务相关
 
-### 17. 步数能手提交后，以弹窗 JSON 判断是否成功
+### 17. 捕获其他 App 弹出的短暂 toast（AutoTasks 的"刷步成功"）
 
-- 弹窗内容形如 `{"code":"1","time":"...","user":"...","step":13502,"status":"success","message":"修改步数（13502）"}`。
-- 要求 `status === "success"`，并且 `step` 等于本次填写的步数，才算成功。JSON 解析失败时，退回到检查文字里有没有 `success`。
+- toast 不在无障碍控件树里，`text()` / `find()` 找不到，只能通过无障碍事件捕获：`events.observeToast()` + `events.onToast(fn)`，回调参数有 `getText()` 和 `getPackageName()`。
+- **回调线程**：AutoJs6 的 `api.Events` 构造时没有绑定 timer，收到 toast 后直接在 Android 主线程上调用回调（`mHandler.post(() -> emit("toast", ...))`），不用等脚本线程空闲。所以脚本线程可以 `sleep()` 轮询等结果，两个线程之间用 `java.util.concurrent.CopyOnWriteArrayList` 传递数据。
+- **必须先监听再点击**：AutoTasks 的弹窗一关闭就立即弹出 toast，而且显示时间很短。
+- **用完必须取消**：`observeToast()` 会设置 `waitWhenIdle(true)`，脚本执行完后会一直挂着不退出。结束时要调用 `events.removeAllListeners("toast")` 和 `events.removeToastObserver()`。
+- **依据**：AutoJs6 v6.7.0 源码 `runtime/api/Events.java`、`core/eventloop/EventEmitter.java`、`core/accessibility/AccessibilityNotificationObserver.kt`；示例 `assets-app/sample/事件与监听/Toast监听.js`。
 
-### 18. 写死的像素值只适用于当前设备
+### 18. 页面上的一段文字在控件树里可能被拆成多个控件
 
-- `MP_MIN_CENTER_Y = 300`、`REWARD_OFFSET_Y = 208` 都是在 OnePlus 13T 上测出来的，换机后需要重新测。
-- 能按文字找到的按钮，优先按文字找（`REWARD_BTN_TEXT`）。
+- 例如鹅厂运动的"**8923** / 6666步"，大号的步数和后面的达标线字号不同，在控件树里可能是一个控件，也可能拆成好几个；领取弹窗里的大号金额"1.05"也可能被拆开。小程序页面的文字有时在 `desc` 里，而不在 `text` 里。
+- **做法**：不匹配固定字符串，而是先确定一个区域（比如"今日步数"和下方按钮之间），收集区域内可见**叶子**控件的 `text` / `desc`，按阅读顺序拼接，再用正则提取（步数：`(\d+)\s*\/\s*(\d+)\s*步`）。
+  - 只取叶子控件：WebView 的父容器可能在 `desc` 里重复带上子控件的文字。
+  - 按"垂直方向是否重叠"分行，而不是按坐标取整分组：字号不同的控件（大号数字和小数点）高度不同，按中心点分组会被分到不同的行，拼出来顺序就乱了。
+- 用 `DEBUG_DUMP` 把关键界面的控件全部打印到日志，可以确认实际结构。
+
+### 19. 写死的像素值只适用于当前设备
+
+- `MP_MIN_CENTER_Y = 300` 是在 OnePlus 13T 上测出来的，换机后需要重新测。
+- 能按文字找到的按钮，优先按文字找。鹅厂运动的领取按钮原来按"今日步数下方 208 像素"盲点，现在改成按按钮文字判断状态再点击。
 
 ---
 

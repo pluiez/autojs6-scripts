@@ -1,5 +1,5 @@
 // ==========================================
-// 终极完美版：步数能手 + WeChat鹅厂运动全自动打卡
+// AutoTasks 刷步 + WeChat 鹅厂运动领取 Q 米
 // (阶段 Toast 提示 + 状态记录 + Shizuku 清理最近任务 + 通知播报)
 // 运行环境：AutoJs6
 // 前置条件：开启无障碍服务；授权 Shizuku（不可用时自动退回到多任务手势清理）
@@ -9,25 +9,37 @@
 
 // ====== 配置 ======
 // 用包名启动 App，不受系统语言影响（App 名称会随语言变化，如 微信 / WeChat）
-var STEPS_PKG = "com.step.bsjl";
+var AUTOTASKS_PKG = "ts.auto.tasks";
 var WECHAT_PKG = "com.tencent.mm";
 var MP_NAME = "鹅厂运动";
 var MP_ACTIVITY = WECHAT_PKG + "/.plugin.appbrand.ui.AppBrandUI"; // 微信小程序界面的组件名前缀（AppBrandUI、AppBrandUI1 ...）
-var STEPS_INPUT_INDEX = 2;       // 步数输入框是页面上第几个 EditText（从 0 开始）
+var STEPS_MIN = 7000;            // 随机步数下限
+var STEPS_MAX = 10000;           // 随机步数上限（AutoTasks 手动刷步只接受 1–10000）
 var LAUNCH_TIMEOUT = 10000;      // 等待 App 打开并显示界面的最长时间（毫秒）
-var SUBMIT_TIMEOUT = 15000;      // 提交后等待结果弹窗的最长时间（毫秒）
+var DIALOG_TIMEOUT = 3000;       // 等待 AutoTasks 手动刷步弹窗出现的最长时间
+var TOAST_TIMEOUT = 2000;        // 点击"开始刷步"后等待结果 toast 的最长时间
+var MP_LOAD_TIMEOUT = 3000;      // 等待鹅厂运动页面加载（"今日步数"出现）的最长时间
+var MP_SYNC_TIMEOUT = 3000;      // 等待步数同步（步数不为 0）的最长时间
+var MP_REFRESH_TIMEOUT = 3000;   // 点击"刷新"后再次等待步数同步的最长时间
+var MP_POPUP_TIMEOUT = 3000;     // 点击领取后等待"今日已成功瓜分Q米"弹窗的最长时间
 var MP_MIN_CENTER_Y = 300;       // 过滤顶部搜索栏等区域的像素阈值，换机需重测
-var REWARD_BTN_TEXT = null;      // 领奖按钮文字（如 "领取"），填写后优先按文字点击
-var REWARD_OFFSET_Y = 208;       // 未填按钮文字时，"今日步数" 下方的像素偏移，换机需重测
+var DEBUG_DUMP = true;           // 在关键界面把所有带文字的控件打印到日志，用于确认控件结构；确认后可关闭
 var REPORT_TITLE = "【今日打卡报告】";
 var REMIND_SCRIPT = "remind.js";          // 同目录的提醒脚本，锁屏无法执行时用它重新发提醒通知
 var REMINDER_NOTICE_ID = 22000;           // remind.js 发出的提醒通知 ID，需与 remind.js 保持一致
 
-// 界面文字：系统语言会在中英文间切换，每项列出所有可能的写法，App 改翻译时在这里补充
-var TEXT_SUBMIT = ["提交", "Submit"];                       // 步数能手的提交按钮
-var TEXT_CONFIRM = ["确定", "OK"];                          // 步数能手结果弹窗的确认按钮
-var TEXT_CONTACTS_TAB = ["通讯录", "Contacts"];              // 微信首页底部标签，用于判断是否在首页
-var TEXT_MP_SEARCH = ["搜索小程序", "Search Mini Programs"]; // 小程序面板顶部的搜索栏
+// 界面文字
+var TEXT_CONTACTS_TAB = ["通讯录", "Contacts"];              // 微信首页底部标签，用于判断是否在首页（系统语言会在中英文间切换）
+var TEXT_MP_SEARCH = ["搜索小程序", "Search Mini Programs"]; // 小程序面板顶部的搜索栏（同上）
+var TEXT_MANUAL_BTN = "手动";                 // AutoTasks 任务卡片上的手动刷步按钮
+var TEXT_START_BTN = "开始刷步";              // AutoTasks 手动刷步弹窗的确认按钮
+var TEXT_STEPS_ANCHOR = "今日步数";           // 鹅厂运动步数卡片标题，用作定位锚点
+var TEXT_REFRESH = "刷新";                    // 鹅厂运动的刷新按钮
+var TEXT_CLAIMABLE = "马上瓜分";              // 可领取时的按钮文字（"马上瓜分今日Q米"）
+var TEXT_CLAIMED = "今日奖励已领取";          // 已领取时的按钮文字
+var TEXT_NOT_ENOUGH = "还差";                 // 步数不足时的按钮文字（"还差6666步就能瓜分Q米，冲鸭 ~"）
+var TEXT_POPUP_TITLE = "今日已成功瓜分Q米";   // 领取成功弹窗标题
+var TEXT_POPUP_CLOSE = "坐等收米";            // 领取成功弹窗的关闭按钮
 
 // 记录各阶段的执行结果，最后统一播报
 var runStatus = [];
@@ -231,39 +243,17 @@ function waitVisibleByText(pkg, texts, timeout) {
     return widget;
 }
 
-// 等待提交结果弹窗，解析其中的 JSON 判断是否成功，然后点击 "确定" 关闭弹窗
-function waitSubmitResult(pkg, expectedSteps) {
-    var node = textContains("\"status\"").packageName(pkg).findOne(SUBMIT_TIMEOUT);
-    if (!node) {
-        return { ok: false, msg: "未等到结果弹窗" };
-    }
-    var raw = String(node.text());
-    var result;
-    try {
-        var data = JSON.parse(raw);
-        result = {
-            ok: data.status === "success" && Number(data.step) === expectedSteps,
-            msg: data.message || data.status
-        };
-    } catch (e) {
-        // 弹窗内容不是标准 JSON 时，退回到关键字判断
-        result = { ok: raw.indexOf("success") >= 0, msg: raw };
-    }
-    var confirmBtn = waitVisibleByText(pkg, TEXT_CONFIRM, 2000);
-    if (confirmBtn && !confirmBtn.click()) {
-        clickCenter(confirmBtn);
-    }
-    return result;
-}
-
 // 判断控件中心是否在屏幕范围内（被收起或滚出屏幕的控件仍在控件树里，但坐标在屏幕外）
 function isOnScreen(widget) {
     var b = widget.bounds();
     return b != null && b.centerX() > 0 && b.centerX() < device.width && b.centerY() > 0 && b.centerY() < device.height;
 }
 
-// 在指定 App 内查找第一个位于屏幕范围内、文字或描述等于 texts 中任一项的控件，找不到返回 null
+// 在指定 App 内查找第一个位于屏幕范围内、文字或描述等于 texts（字符串或字符串数组）中任一项的控件，找不到返回 null
 function findVisibleByText(pkg, texts) {
+    if (typeof texts === "string") {
+        texts = [texts];
+    }
     for (var t = 0; t < texts.length; t++) {
         var groups = [text(texts[t]).packageName(pkg).find(), desc(texts[t]).packageName(pkg).find()];
         for (var g = 0; g < groups.length; g++) {
@@ -275,6 +265,190 @@ function findVisibleByText(pkg, texts) {
         }
     }
     return null;
+}
+
+// 在指定 App 内查找第一个位于屏幕范围内、文字或描述包含 str 的控件，找不到返回 null
+// 小程序页面的文字可能在 text 也可能在 desc 里，而且按钮文字常带有额外内容，所以用包含匹配
+function findVisibleContaining(pkg, str) {
+    var groups = [textContains(str).packageName(pkg).find(), descContains(str).packageName(pkg).find()];
+    for (var g = 0; g < groups.length; g++) {
+        for (var i = 0; i < groups[g].length; i++) {
+            if (isOnScreen(groups[g][i])) {
+                return groups[g][i];
+            }
+        }
+    }
+    return null;
+}
+
+// 在指定时间内等待 findVisibleContaining 找到控件，找不到返回 null
+function waitVisibleContaining(pkg, str, timeout) {
+    var deadline = Date.now() + timeout;
+    var widget = findVisibleContaining(pkg, str);
+    while (!widget && Date.now() < deadline) {
+        sleep(200);
+        widget = findVisibleContaining(pkg, str);
+    }
+    return widget;
+}
+
+// 点击控件：优先用无障碍点击，控件不可点击时改为点击坐标中心
+function tap(widget) {
+    if (!widget.click()) {
+        clickCenter(widget);
+    }
+}
+
+// 返回控件的文字：text 为空时取 desc
+function nodeText(widget) {
+    var t = widget.text();
+    if (t == null || String(t) === "") {
+        t = widget.desc();
+    }
+    return t == null ? "" : String(t);
+}
+
+// 收集指定 App 中、垂直方向位于 [top, bottom] 区间内的可见叶子控件文字，按从上到下、从左到右的顺序拼接
+// 只取叶子控件，避免父容器重复带上子控件的文字。
+// 分行时按垂直方向是否重叠判断：字号不同的控件（如大号数字和小数点）高度不同，但只要上下有重叠就算同一行
+function collectTextInBand(pkg, top, bottom) {
+    var nodes = packageName(pkg).find();
+    var items = [];
+    for (var i = 0; i < nodes.length; i++) {
+        var n = nodes[i];
+        if (n.childCount() > 0 || !isOnScreen(n)) {
+            continue;
+        }
+        var b = n.bounds();
+        var t = nodeText(n);
+        if (t !== "" && b.top >= top && b.bottom <= bottom) {
+            items.push({ top: b.top, bottom: b.bottom, left: b.left, text: t });
+        }
+    }
+    items.sort(function (a, b) { return a.top - b.top; });
+    var rows = [];
+    for (var k = 0; k < items.length; k++) {
+        var row = rows.length ? rows[rows.length - 1] : null;
+        if (row && items[k].top < row.bottom) {
+            row.items.push(items[k]);
+            row.bottom = Math.max(row.bottom, items[k].bottom);
+        } else {
+            rows.push({ bottom: items[k].bottom, items: [items[k]] });
+        }
+    }
+    return rows.map(function (r) {
+        r.items.sort(function (a, b) { return a.left - b.left; });
+        return r.items.map(function (it) { return it.text; }).join("");
+    }).join("");
+}
+
+// 调试：把指定 App 中所有可见、带文字的控件打印到日志（DEBUG_DUMP 为 true 时生效）
+function debugDump(label, pkg) {
+    if (!DEBUG_DUMP) {
+        return;
+    }
+    var nodes = packageName(pkg).find();
+    log("[DUMP] ==== " + label + "（共 " + nodes.length + " 个控件）====");
+    for (var i = 0; i < nodes.length; i++) {
+        var n = nodes[i];
+        var t = n.text();
+        var d = n.desc();
+        if ((t == null || String(t) === "") && (d == null || String(d) === "")) {
+            continue;
+        }
+        log("[DUMP] " + n.className() + " text=" + JSON.stringify(t == null ? null : String(t)) +
+            " desc=" + JSON.stringify(d == null ? null : String(d)) +
+            " bounds=" + n.bounds() + " children=" + n.childCount() + " clickable=" + n.clickable() +
+            (isOnScreen(n) ? "" : " (屏幕外)"));
+    }
+}
+
+// ====== AutoTasks：toast 监听 ======
+// toast 不在控件树里，只能通过无障碍事件捕获。AutoJs6 在 Android 主线程上回调监听函数，
+// 所以脚本线程 sleep 轮询时也能收到；用线程安全的列表在两个线程间传递结果
+var capturedToasts = new java.util.concurrent.CopyOnWriteArrayList();
+
+function startToastWatch(pkg) {
+    capturedToasts.clear();
+    events.observeToast();
+    events.onToast(function (t) {
+        if (String(t.getPackageName()) == pkg) {
+            capturedToasts.add(String(t.getText()));
+        }
+    });
+}
+
+// 等待第一条 toast，超时返回 null
+function waitToast(timeout) {
+    var deadline = Date.now() + timeout;
+    while (capturedToasts.isEmpty() && Date.now() < deadline) {
+        sleep(100);
+    }
+    return capturedToasts.isEmpty() ? null : String(capturedToasts.get(0));
+}
+
+// 停止监听。observeToast 会让脚本在执行完后保持运行，必须移除，否则脚本不会退出
+function stopToastWatch() {
+    events.removeAllListeners("toast");
+    events.removeToastObserver();
+}
+
+// ====== 鹅厂运动：读取页面状态 ======
+
+// 读取"今日步数"卡片中的当前步数和达标线，返回 { steps, target }，读不到返回 null
+// 步数和达标线可能是一个控件（"8923 / 6666步"），也可能拆成多个控件，所以先拼接区域内的文字再用正则提取
+function readSteps(pkg) {
+    var anchor = findVisibleContaining(pkg, TEXT_STEPS_ANCHOR);
+    if (!anchor) {
+        return null;
+    }
+    var top = anchor.bounds().top;
+    var btn = findStateButton(pkg);
+    var bottom = btn ? btn.node.bounds().top : anchor.bounds().bottom + device.height * 0.1;
+    var m = collectTextInBand(pkg, top, bottom).match(/(\d+)\s*\/\s*(\d+)\s*步/);
+    return m ? { steps: parseInt(m[1], 10), target: parseInt(m[2], 10) } : null;
+}
+
+// 找到步数卡片下方的状态按钮，返回 { state, node, text }，找不到返回 null
+// state：claimable 可领取 / claimed 已领取 / notEnough 步数不足
+function findStateButton(pkg) {
+    var candidates = [["claimable", TEXT_CLAIMABLE], ["claimed", TEXT_CLAIMED], ["notEnough", TEXT_NOT_ENOUGH]];
+    for (var i = 0; i < candidates.length; i++) {
+        var node = findVisibleContaining(pkg, candidates[i][1]);
+        if (node) {
+            return { state: candidates[i][0], node: node, text: nodeText(node) };
+        }
+    }
+    return null;
+}
+
+// 等待步数同步（步数大于 0），超时返回最后一次读到的结果（可能为 null）
+function waitStepsSynced(pkg, timeout) {
+    var deadline = Date.now() + timeout;
+    var info = readSteps(pkg);
+    while ((!info || info.steps <= 0) && Date.now() < deadline) {
+        sleep(500);
+        info = readSteps(pkg);
+    }
+    return info;
+}
+
+// 点击领取后，等待成功弹窗并读出领取的 Q 米数量，然后关闭弹窗；返回数量字符串，失败返回 null
+function readClaimedAmount(pkg) {
+    var title = waitVisibleContaining(pkg, TEXT_POPUP_TITLE, MP_POPUP_TIMEOUT);
+    debugDump("鹅厂运动领取弹窗", pkg);
+    if (!title) {
+        return null;
+    }
+    // 金额在标题正下方，区域下边界取关闭按钮上方，找不到关闭按钮时取标题下方 12% 屏幕高度
+    var closeBtn = findVisibleContaining(pkg, TEXT_POPUP_CLOSE);
+    var top = title.bounds().bottom;
+    var bottom = Math.min(top + device.height * 0.12, closeBtn ? closeBtn.bounds().top : device.height);
+    var m = collectTextInBand(pkg, top, bottom).match(/\d+(?:\.\d+)?/);
+    if (closeBtn) {
+        tap(closeBtn);
+    }
+    return m ? m[0] : null;
 }
 
 // 让微信拉出小程序面板，成功返回 true
@@ -341,46 +515,59 @@ notice.cancel(REMINDER_NOTICE_ID);
 // 确保无障碍服务已开启，未开启时会跳转设置页并等待
 auto.waitFor();
 
-// ====== 第一阶段：步数能手任务 ======
-var stepsPkg = STEPS_PKG;
+// ====== 第一阶段：AutoTasks 手动刷步 ======
+var autoTasksPkg = AUTOTASKS_PKG;
 try {
-    log("正在打开步数能手App...");
-    app.launch(stepsPkg);
+    log("正在打开 AutoTasks...");
+    app.launch(autoTasksPkg);
     // 先等 App 进入前台，再只在该 App 内查找控件，避免误找到 AutoJs6 等其他界面的控件
-    if (!waitForApp(stepsPkg, LAUNCH_TIMEOUT)) {
-        log("等待步数能手进入前台超时");
+    if (!waitForApp(autoTasksPkg, LAUNCH_TIMEOUT)) {
+        log("等待 AutoTasks 进入前台超时");
     }
 
-    var randomSteps = random(7000, 15000);
-    log("本次随机生成步数：" + randomSteps);
-
-    var inputFields = waitForInputs(stepsPkg, STEPS_INPUT_INDEX + 1, LAUNCH_TIMEOUT);
-    if (inputFields.length > STEPS_INPUT_INDEX) {
-        inputFields[STEPS_INPUT_INDEX].setText(randomSteps.toString());
-        sleep(500);
-
-        var submitBtn = waitVisibleByText(stepsPkg, TEXT_SUBMIT, 2000);
-        if (submitBtn) {
-            submitBtn.click();
-            var submitResult = waitSubmitResult(stepsPkg, randomSteps);
-            if (submitResult.ok) {
-                reportStage("✅ 步数修改：" + randomSteps + " 步");
-            } else {
-                reportStage("❌ 步数修改：" + submitResult.msg);
-            }
-        } else {
-            reportStage("❌ 步数修改：找不到提交按钮");
-        }
+    var manualBtn = waitVisibleByText(autoTasksPkg, TEXT_MANUAL_BTN, LAUNCH_TIMEOUT);
+    if (!manualBtn) {
+        debugDump("AutoTasks 首页（未找到手动按钮）", autoTasksPkg);
+        reportStage("❌ 刷步：找不到「" + TEXT_MANUAL_BTN + "」按钮");
     } else {
-        reportStage("❌ 步数修改：未找到输入框");
+        tap(manualBtn);
+        var inputs = waitForInputs(autoTasksPkg, 1, DIALOG_TIMEOUT);
+        debugDump("AutoTasks 手动刷步弹窗", autoTasksPkg);
+        var startBtn = waitVisibleByText(autoTasksPkg, TEXT_START_BTN, DIALOG_TIMEOUT);
+        if (inputs.length < 1) {
+            reportStage("❌ 刷步：未找到步数输入框");
+        } else if (!startBtn) {
+            reportStage("❌ 刷步：找不到「" + TEXT_START_BTN + "」按钮");
+        } else {
+            var randomSteps = random(STEPS_MIN, STEPS_MAX);
+            inputs[0].setText(String(randomSteps));
+            sleep(300);
+            log("本次随机生成步数：" + randomSteps + "，输入框当前内容：" + nodeText(inputs[0]));
+
+            // 弹窗关闭后立即弹出结果 toast 且显示时间很短，所以要在点击之前开始监听
+            startToastWatch(autoTasksPkg);
+            try {
+                tap(startBtn);
+                var toastText = waitToast(TOAST_TIMEOUT);
+            } finally {
+                stopToastWatch();
+            }
+            if (toastText == null) {
+                reportStage("⚠️ 刷步：未捕获到结果提示（" + randomSteps + " 步）");
+            } else if (toastText.indexOf("成功") >= 0) {
+                reportStage("✅ 刷步成功：" + randomSteps + " 步");
+            } else {
+                reportStage("❌ 刷步失败：" + toastText);
+            }
+        }
     }
 } catch (e) {
     log(e);
-    reportStage("❌ 步数能手：执行异常 " + e);
+    reportStage("❌ AutoTasks：执行异常 " + e);
 }
 
-// 任务完成，关闭步数能手
-closeApp(stepsPkg);
+// 任务完成，关闭 AutoTasks
+closeApp(autoTasksPkg);
 sleep(1000);
 
 // ====== 第二阶段：唤起微信与寻找小程序 ======
@@ -435,30 +622,43 @@ try {
         reportStage("❌ 鹅厂运动：未能打开小程序");
     }
 
-    // ====== 第三阶段：打卡 ======
+    // ====== 第三阶段：领取 Q 米 ======
     if (isMpOpened) {
-        // 留足网络加载时间，确保图片和文字全部出来
-        sleep(4000);
-
-        // 优先按按钮文字点击，找不到再按锚点偏移盲点
-        var rewardBtn = null;
-        if (REWARD_BTN_TEXT) {
-            rewardBtn = textContains(REWARD_BTN_TEXT).findOne(3000) || descContains(REWARD_BTN_TEXT).findOne(1000);
+        if (!waitVisibleContaining(wechatPkg, TEXT_STEPS_ANCHOR, MP_LOAD_TIMEOUT)) {
+            log("等待鹅厂运动页面加载超时");
         }
 
-        if (rewardBtn && rewardBtn.bounds() != null) {
-            clickCenter(rewardBtn);
-            reportStage("✅ 鹅厂运动：已点击「" + REWARD_BTN_TEXT + "」");
-            sleep(1500);
-        } else {
-            var anchor = textContains("今日步数").findOne(3000) || descContains("今日步数").findOne(2000);
-            if (anchor && anchor.bounds() != null) {
-                click(device.width / 2, anchor.bounds().bottom + REWARD_OFFSET_Y);
-                reportStage("✅ 鹅厂运动：已按锚点偏移点击");
-                sleep(1500);
-            } else {
-                reportStage("❌ 鹅厂运动：未找到打卡锚点");
+        // 打开后要过一会儿才会同步步数，先等待，仍为 0 时点一次"刷新"再等
+        var stepsInfo = waitStepsSynced(wechatPkg, MP_SYNC_TIMEOUT);
+        if (!stepsInfo || stepsInfo.steps <= 0) {
+            var refreshBtn = findVisibleContaining(wechatPkg, TEXT_REFRESH);
+            if (refreshBtn) {
+                log("步数未同步，点击刷新");
+                tap(refreshBtn);
+                stepsInfo = waitStepsSynced(wechatPkg, MP_REFRESH_TIMEOUT);
             }
+        }
+        debugDump("鹅厂运动首页", wechatPkg);
+        var stepsDesc = stepsInfo ? stepsInfo.steps + "/" + stepsInfo.target : "步数未知";
+        log("鹅厂运动步数：" + stepsDesc);
+
+        // 按状态按钮的文字判断当前状态
+        var stateBtn = findStateButton(wechatPkg);
+        if (!stateBtn) {
+            reportStage("⚠️ 鹅厂运动：未识别到领取按钮（" + stepsDesc + "）");
+        } else if (stateBtn.state == "claimed") {
+            reportStage("ℹ️ 鹅厂运动：今日奖励已领取（" + stepsDesc + "）");
+        } else if (stateBtn.state == "notEnough") {
+            reportStage("❌ 鹅厂运动：步数未达标（" + stepsDesc + "）");
+        } else {
+            tap(stateBtn.node);
+            var amount = readClaimedAmount(wechatPkg);
+            if (amount != null) {
+                reportStage("✅ 鹅厂运动：领取 " + amount + " Q米（" + stepsDesc + "）");
+            } else {
+                reportStage("⚠️ 鹅厂运动：已点击领取，但未读到领取结果（" + stepsDesc + "）");
+            }
+            sleep(1000);
         }
     }
 } catch (e) {
