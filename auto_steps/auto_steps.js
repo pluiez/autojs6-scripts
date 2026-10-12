@@ -21,7 +21,9 @@ var TOAST_TIMEOUT = 2000;        // 点击"开始刷步"后等待结果 toast �
 var MP_LOAD_TIMEOUT = 3000;      // 等待鹅厂运动页面加载（"今日步数"出现）的最长时间
 var MP_SYNC_TIMEOUT = 3000;      // 等待步数同步（步数不为 0）的最长时间
 var MP_REFRESH_TIMEOUT = 3000;   // 点击"刷新"后再次等待步数同步的最长时间
-var MP_POPUP_TIMEOUT = 3000;     // 点击领取后等待"今日已成功瓜分Q米"弹窗的最长时间
+var MP_POPUP_TIMEOUT = 5000;     // 点击领取后等待领取成功弹窗出现的最长时间
+var MP_AMOUNT_TIMEOUT = 8000;    // 弹窗出现后等待金额滚动动画停稳的最长时间
+var MP_AMOUNT_STABLE = 1500;     // 金额读数保持不变多久才算动画停稳
 var MP_MIN_CENTER_Y = 300;       // 过滤顶部搜索栏等区域的像素阈值，换机需重测
 var DEBUG_DUMP = true;           // 在关键界面把所有带文字的控件打印到日志，用于确认控件结构；确认后可关闭
 var REPORT_TITLE = "【今日打卡报告】";
@@ -38,8 +40,8 @@ var TEXT_REFRESH = "刷新";                    // 鹅厂运动的刷新按钮
 var TEXT_CLAIMABLE = "马上瓜分";              // 可领取时的按钮文字（"马上瓜分今日Q米"）
 var TEXT_CLAIMED = "今日奖励已领取";          // 已领取时的按钮文字
 var TEXT_NOT_ENOUGH = "还差";                 // 步数不足时的按钮文字（"还差6666步就能瓜分Q米，冲鸭 ~"）
-var TEXT_POPUP_TITLE = "今日已成功瓜分Q米";   // 领取成功弹窗标题
-var TEXT_POPUP_CLOSE = "坐等收米";            // 领取成功弹窗的关闭按钮
+var TEXT_POPUP_CLOSE = "坐等收米";            // 领取成功弹窗的关闭按钮，也用来判断弹窗是否出现（标题"今日已成功瓜分Q米"是图片，控件树里没有）
+var TEXT_AMOUNT_DOT = ".";                    // 领取金额的小数点，单独一个控件，用作定位滚动数字列的基准
 
 // 记录各阶段的执行结果，最后统一播报
 var runStatus = [];
@@ -433,22 +435,103 @@ function waitStepsSynced(pkg, timeout) {
     return info;
 }
 
-// 点击领取后，等待成功弹窗并读出领取的 Q 米数量，然后关闭弹窗；返回数量字符串，失败返回 null
-function readClaimedAmount(pkg) {
-    var title = waitVisibleContaining(pkg, TEXT_POPUP_TITLE, MP_POPUP_TIMEOUT);
-    debugDump("鹅厂运动领取弹窗", pkg);
-    if (!title) {
+// 读取领取弹窗中的金额，返回字符串（如 "1.1"、"0.68"），读不到返回 null
+// 金额是滚动数字：每一位是一列竖排的 0–9 TextView，靠上下平移让正确的数字停在显示窗口里，
+// 其余数字只是被遮住，在控件树里仍是"可见"的。所以以小数点为基准，每列取垂直中心最接近小数点中心的那一格，
+// 再从小数点向左、向右分别拼接相邻的列（列间距不超过两个小数点宽度）
+function readOdometer(pkg) {
+    var dot = findVisibleByText(pkg, TEXT_AMOUNT_DOT);
+    if (!dot) {
         return null;
     }
-    // 金额在标题正下方，区域下边界取关闭按钮上方，找不到关闭按钮时取标题下方 12% 屏幕高度
+    var db = dot.bounds();
+    var cy = db.centerY();
+    var nodes = packageName(pkg).find();
+    var cols = {};
+    for (var i = 0; i < nodes.length; i++) {
+        var n = nodes[i];
+        var t = nodeText(n);
+        if (n.childCount() > 0 || !/^\d$/.test(t)) {
+            continue;
+        }
+        var b = n.bounds();
+        if (b.top > cy || b.bottom < cy) {
+            continue;
+        }
+        var dist = Math.abs(b.centerY() - cy);
+        if (!cols[b.left] || dist < cols[b.left].dist) {
+            cols[b.left] = { left: b.left, right: b.right, dist: dist, text: t };
+        }
+    }
+    var list = Object.keys(cols).map(function (k) { return cols[k]; });
+    list.sort(function (a, b) { return a.left - b.left; });
+    var maxGap = db.width() * 2;
+    var intPart = "";
+    var edge = db.left;
+    for (var l = list.length - 1; l >= 0; l--) {
+        if (list[l].right > db.left) {
+            continue;
+        }
+        if (edge - list[l].right > maxGap) {
+            break;
+        }
+        intPart = list[l].text + intPart;
+        edge = list[l].left;
+    }
+    var fracPart = "";
+    edge = db.right;
+    for (var r = 0; r < list.length; r++) {
+        if (list[r].left < db.right) {
+            continue;
+        }
+        if (list[r].left - edge > maxGap) {
+            break;
+        }
+        fracPart += list[r].text;
+        edge = list[r].right;
+    }
+    return intPart !== "" && fracPart !== "" ? intPart + "." + fracPart : null;
+}
+
+// 等待金额滚动动画停稳：每 300 毫秒读一次，读数保持不变满 MP_AMOUNT_STABLE 毫秒才采用
+// 只比较相邻两次不够：动画开始前可能先停在初始位置一小段时间，会被误当成结果。
+// 超时仍未停稳时返回最后一次读数并加"?"，读不到返回 null
+function waitAmountStable(pkg, timeout) {
+    var start = Date.now();
+    var last = null;
+    var since = start;
+    while (true) {
+        var cur = readOdometer(pkg);
+        var now = Date.now();
+        if (cur !== last) {
+            log("领取金额读数（弹窗出现后 " + (now - start) + "ms）：" + cur);
+            last = cur;
+            since = now;
+        } else if (cur != null && now - since >= MP_AMOUNT_STABLE) {
+            return cur;
+        }
+        if (now - start >= timeout) {
+            return last == null ? null : last + "?";
+        }
+        sleep(300);
+    }
+}
+
+// 点击领取后，等待成功弹窗并读出领取的 Q 米数量，然后关闭弹窗；返回数量字符串，失败返回 null
+function readClaimedAmount(pkg) {
+    if (!waitVisibleContaining(pkg, TEXT_POPUP_CLOSE, MP_POPUP_TIMEOUT)) {
+        debugDump("鹅厂运动领取弹窗（未出现）", pkg);
+        return null;
+    }
+    debugDump("鹅厂运动领取弹窗（刚出现）", pkg);
+    var amount = waitAmountStable(pkg, MP_AMOUNT_TIMEOUT);
+    debugDump("鹅厂运动领取弹窗（读数后）", pkg);
+    // 弹窗有缩放动画，开始等到的控件坐标可能已过时，点击前重新查找
     var closeBtn = findVisibleContaining(pkg, TEXT_POPUP_CLOSE);
-    var top = title.bounds().bottom;
-    var bottom = Math.min(top + device.height * 0.12, closeBtn ? closeBtn.bounds().top : device.height);
-    var m = collectTextInBand(pkg, top, bottom).match(/\d+(?:\.\d+)?/);
     if (closeBtn) {
         tap(closeBtn);
     }
-    return m ? m[0] : null;
+    return amount;
 }
 
 // 让微信拉出小程序面板，成功返回 true
