@@ -167,6 +167,19 @@ AutoJs6 支持 Shizuku。确认 Shizuku 可用后，可以用 `shizuku(cmd)` 执
 - `MP_MIN_CENTER_Y = 300` 是在 OnePlus 13T 上测出来的，换机后需要重新测。
 - 能按文字找到的按钮，优先按文字找。鹅厂运动的领取按钮原来按"今日步数下方 208 像素"盲点，现在改成按按钮文字判断状态再点击。
 
+### 20. 小程序页面里的控件要用坐标点击，并确认点击生效
+
+- **现象**：鹅厂运动首页已经显示"7815 / 6666步"和"马上瓜分今日Q米"按钮，脚本找到按钮并点击，没有任何报错，但 5 秒后页面毫无变化，按钮还是可领取状态。
+- **原因**：
+  - 当时用的 `tap()` 先调用 `widget.click()`（无障碍 `ACTION_CLICK`），返回 false 才退回到坐标点击。小程序页面由 WebView 渲染（微信的 XWeb，基于 Chromium），WebView 收到 `ACTION_CLICK` 后只是把动作异步转交给页面，只要节点存在且没被禁用就立即返回 true。所以返回 true 不代表页面响应了，`tap()` 也就不会退回到坐标点击。
+  - 页面收到后模拟的是 pointer、mouse、click 事件，**没有 touch 事件**。小程序的 `tap` 事件定义为"手指触摸后马上离开"，无障碍点击能不能触发 `bindtap`，取决于小程序基础库怎么处理，没有保证。
+  - 这次失败是不是这个原因，日志里看不出来：也可能是领取请求被服务端拒绝了（当时刚过零点），页面的提示只显示一两秒，5 秒后再 dump 已经看不到。
+- **解决**（见 `claimReward()`）：
+  - 小程序页面里的控件一律用 `clickCenter()` 坐标点击。它通过无障碍手势（`dispatchGesture`）注入一次真实的触摸，和手指点击一样。`tap()` 只用于原生界面。
+  - 每次点击后确认页面有反应：领取弹窗出现，或按钮变成"今日奖励已领取"。按钮还是可领取状态就重新查找按钮再点，最多 `MP_CLAIM_ATTEMPTS` 次。
+  - 等待期间把页面上新出现的文字记到日志，再失败时能看到页面给出的提示。
+- **依据**：Chromium 源码 `content/public/android/java/src/org/chromium/content/browser/accessibility/WebContentsAccessibilityImpl.java`（`performAction` → `performClick`）、`content/browser/accessibility/web_contents_accessibility_android.cc`（`Click()` 调用 `DoDefaultAction` 后直接返回 true）、`third_party/blink/renderer/modules/accessibility/ax_object.cc`（`OnNativeClickAction`）、`third_party/blink/renderer/core/dom/events/event_dispatcher.cc`（`DispatchSimulatedClick`）；AutoJs6 v6.7.0 源码 `core/automator/UiObjectActions.kt`（`click()` 就是 `performAction(ACTION_CLICK)`）、`core/automator/GlobalActionAutomator.kt`（`click(x, y)` 是手势）；微信开发文档"事件"一章对 `tap` 的定义。读的是上游 Chromium 的代码，XWeb 是它的分支，没有逐行核对。
+
 ---
 
 ## 五、平台选择

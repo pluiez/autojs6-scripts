@@ -21,7 +21,8 @@ var TOAST_TIMEOUT = 2000;        // 点击"开始刷步"后等待结果 toast �
 var MP_LOAD_TIMEOUT = 3000;      // 等待鹅厂运动页面加载（"今日步数"出现）的最长时间
 var MP_SYNC_TIMEOUT = 3000;      // 等待步数同步（步数不为 0）的最长时间
 var MP_REFRESH_TIMEOUT = 3000;   // 点击"刷新"后再次等待步数同步的最长时间
-var MP_POPUP_TIMEOUT = 5000;     // 点击领取后等待领取成功弹窗出现的最长时间
+var MP_POPUP_TIMEOUT = 5000;     // 每次点击领取后等待领取成功弹窗出现的最长时间
+var MP_CLAIM_ATTEMPTS = 3;       // 点击领取后页面没有反应时，最多点击几次
 var MP_AMOUNT_TIMEOUT = 8000;    // 弹窗出现后等待金额滚动动画停稳的最长时间
 var MP_AMOUNT_STABLE = 1500;     // 金额读数保持不变多久才算动画停稳
 var MP_MIN_CENTER_Y = 300;       // 过滤顶部搜索栏等区域的像素阈值，换机需重测
@@ -205,7 +206,8 @@ function closeByRecents() {
     sleep(500); // 等待清理动画结束
 }
 
-// 点击控件中心，适用于控件本身不可点击的情况
+// 点击控件中心，适用于控件本身不可点击的情况，以及小程序页面里的控件
+// 这是坐标点击，通过无障碍手势注入一次真实的触摸，和手指点击一样
 function clickCenter(widget) {
     var b = widget.bounds();
     click(b.centerX(), b.centerY());
@@ -294,7 +296,9 @@ function waitVisibleContaining(pkg, str, timeout) {
     return widget;
 }
 
-// 点击控件：优先用无障碍点击，控件不可点击时改为点击坐标中心
+// 点击原生界面的控件：优先用无障碍点击，控件不可点击时改为点击坐标中心
+// 小程序页面（WebView 渲染）里的控件不要用它，改用 clickCenter()：WebView 收到无障碍点击后只是转交给页面，
+// 不管页面有没有响应都返回 true，这里就不会退回到坐标点击
 function tap(widget) {
     if (!widget.click()) {
         clickCenter(widget);
@@ -308,6 +312,24 @@ function nodeText(widget) {
         t = widget.desc();
     }
     return t == null ? "" : String(t);
+}
+
+// 返回指定 App 中所有位于屏幕范围内的控件文字（去重，text 为空时取 desc）
+function visibleTexts(pkg) {
+    var nodes = packageName(pkg).find();
+    var texts = [];
+    for (var i = 0; i < nodes.length; i++) {
+        var t = nodeText(nodes[i]);
+        if (t !== "" && texts.indexOf(t) < 0 && isOnScreen(nodes[i])) {
+            texts.push(t);
+        }
+    }
+    return texts;
+}
+
+// 判断文字列表中是否有包含 str 的项
+function anyContains(texts, str) {
+    return texts.some(function (t) { return t.indexOf(str) >= 0; });
 }
 
 // 收集指定 App 中、垂直方向位于 [top, bottom] 区间内的可见叶子控件文字，按从上到下、从左到右的顺序拼接
@@ -517,19 +539,63 @@ function waitAmountStable(pkg, timeout) {
     }
 }
 
-// 点击领取后，等待成功弹窗并读出领取的 Q 米数量，然后关闭弹窗；返回数量字符串，失败返回 null
-function readClaimedAmount(pkg) {
-    if (!waitVisibleContaining(pkg, TEXT_POPUP_CLOSE, MP_POPUP_TIMEOUT)) {
-        debugDump("鹅厂运动领取弹窗（未出现）", pkg);
-        return null;
+// 点击领取后等待领取成功弹窗，出现返回 true，超时返回 false
+// 等待期间把页面上新出现的文字记到日志：领取失败时的提示可能只显示一两秒，等到超时再 dump 就看不到了。
+// 只记两个字及以上的文字，跳过滚动数字的单个数字和图标字体
+function waitClaimPopup(pkg, before, timeout) {
+    var deadline = Date.now() + timeout;
+    var seen = before.slice();
+    while (true) {
+        var texts = visibleTexts(pkg);
+        if (anyContains(texts, TEXT_POPUP_CLOSE)) {
+            return true;
+        }
+        for (var i = 0; i < texts.length; i++) {
+            if (texts[i].length >= 2 && seen.indexOf(texts[i]) < 0) {
+                seen.push(texts[i]);
+                log("点击领取后出现：" + texts[i]);
+            }
+        }
+        if (Date.now() >= deadline) {
+            return false;
+        }
+        sleep(300);
     }
+}
+
+// 点击领取按钮，返回 "popup"（领取弹窗出现）、"claimed"（按钮已变成已领取，但没等到弹窗）或 null（领取失败）
+// 用坐标点击，原因见 tap()。点击被吞掉时页面没有任何反应，所以每次点击后都要确认结果；
+// 按钮仍是可领取状态就重新查找按钮再点，最多点 MP_CLAIM_ATTEMPTS 次
+function claimReward(pkg, button) {
+    for (var attempt = 1; attempt <= MP_CLAIM_ATTEMPTS; attempt++) {
+        var before = visibleTexts(pkg);
+        clickCenter(button);
+        if (waitClaimPopup(pkg, before, MP_POPUP_TIMEOUT)) {
+            return "popup";
+        }
+        var state = findStateButton(pkg);
+        if (state && state.state == "claimed") {
+            return "claimed";
+        }
+        if (!state || state.state != "claimable") {
+            log("第 " + attempt + " 次点击领取后未出现弹窗，按钮变为：" + (state ? state.text : "未找到"));
+            return null;
+        }
+        log("第 " + attempt + " 次点击领取后页面没有反应");
+        button = state.node;
+    }
+    return null;
+}
+
+// 领取弹窗出现后，读出领取的 Q 米数量，然后关闭弹窗；返回数量字符串，读不到返回 null
+function readClaimedAmount(pkg) {
     debugDump("鹅厂运动领取弹窗（刚出现）", pkg);
     var amount = waitAmountStable(pkg, MP_AMOUNT_TIMEOUT);
     debugDump("鹅厂运动领取弹窗（读数后）", pkg);
     // 弹窗有缩放动画，开始等到的控件坐标可能已过时，点击前重新查找
     var closeBtn = findVisibleContaining(pkg, TEXT_POPUP_CLOSE);
     if (closeBtn) {
-        tap(closeBtn);
+        clickCenter(closeBtn);
     }
     return amount;
 }
@@ -717,7 +783,7 @@ try {
             var refreshBtn = findVisibleContaining(wechatPkg, TEXT_REFRESH);
             if (refreshBtn) {
                 log("步数未同步，点击刷新");
-                tap(refreshBtn);
+                clickCenter(refreshBtn);
                 stepsInfo = waitStepsSynced(wechatPkg, MP_REFRESH_TIMEOUT);
             }
         }
@@ -734,12 +800,15 @@ try {
         } else if (stateBtn.state == "notEnough") {
             reportStage("❌ 鹅厂运动：步数未达标（" + stepsDesc + "）");
         } else {
-            tap(stateBtn.node);
-            var amount = readClaimedAmount(wechatPkg);
+            var claim = claimReward(wechatPkg, stateBtn.node);
+            var amount = claim == "popup" ? readClaimedAmount(wechatPkg) : null;
             if (amount != null) {
                 reportStage("✅ 鹅厂运动：领取 " + amount + " Q米（" + stepsDesc + "）");
+            } else if (claim != null) {
+                reportStage("✅ 鹅厂运动：领取成功，未读到数量（" + stepsDesc + "）");
             } else {
-                reportStage("⚠️ 鹅厂运动：已点击领取，但未读到领取结果（" + stepsDesc + "）");
+                debugDump("鹅厂运动领取弹窗（未出现）", wechatPkg);
+                reportStage("❌ 鹅厂运动：领取失败，未出现领取弹窗（" + stepsDesc + "）");
             }
             sleep(1000);
         }

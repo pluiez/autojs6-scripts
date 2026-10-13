@@ -16,6 +16,7 @@
 - **用包名启动 App**（`app.launch(pkg)`）。App 名称会随系统语言变化，按名称启动可能找不到。
 - **选择器加上 `.packageName(pkg)`**；启动 App 后，先等它进入前台再查找控件。否则可能找到 AutoJs6 自己界面上的控件。
 - **点击前检查控件是否在屏幕范围内**：被收起或滚出屏幕的控件仍在控件树里，`find()` 照样能找到，但坐标在屏幕外。
+- **小程序（WebView）页面里的控件用坐标点击**（`clickCenter()`），不要用 `widget.click()`：WebView 收到无障碍点击后，不管页面有没有响应都返回 true。点击后要确认页面有反应。详见 pitfalls.md 第 20 条。
 - **Toast**：
   - 从 Android 12 起，系统会限制**后台 App** 的 toast 频率，超出的直接丢弃：20 秒内 3 条、42 秒内 5 条、68 秒内 6 条。脚本运行时 AutoJs6 通常在后台，所以要控制 toast 数量。
   - 弹新 toast 前先 `toast.dismissAll(); sleep(150);`，避免队列堆积。
