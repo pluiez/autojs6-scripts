@@ -23,8 +23,10 @@ var MP_SYNC_TIMEOUT = 3000;      // 等待步数同步（步数不为 0）的最
 var MP_REFRESH_TIMEOUT = 3000;   // 点击"刷新"后再次等待步数同步的最长时间
 var MP_POPUP_TIMEOUT = 5000;     // 每次点击领取后等待领取成功弹窗出现的最长时间
 var MP_CLAIM_ATTEMPTS = 3;       // 点击领取后页面没有反应时，最多点击几次
-var MP_AMOUNT_TIMEOUT = 8000;    // 弹窗出现后等待金额滚动动画停稳的最长时间
-var MP_AMOUNT_STABLE = 1500;     // 金额读数保持不变多久才算动画停稳
+var MP_SETTLE_DELAY = 1000;      // 点击领取弹窗、Q 米记录入口前先等一会儿，让弹窗和页面切换的动画结束
+var MP_STEP_TIMEOUT = 3000;      // 去 Q 米记录页的每一步点击后，等待页面响应（弹窗关闭、出现奖励记录入口）的最长时间
+var MP_RECORD_TIMEOUT = 8000;    // 点击 Q 米记录入口后，等待记录页显示今天这一行的最长时间
+var MP_RECORD_ATTEMPTS = 2;      // 去 Q 米记录页的每一步点击后页面没有变化时，最多点击几次
 var MP_MIN_CENTER_Y = 300;       // 过滤顶部搜索栏等区域的像素阈值，换机需重测
 var DEBUG_DUMP = true;           // 在关键界面把所有带文字的控件打印到日志，用于确认控件结构；确认后可关闭
 var REPORT_TITLE = "【今日打卡报告】";
@@ -41,8 +43,11 @@ var TEXT_REFRESH = "刷新";                    // 鹅厂运动的刷新按钮
 var TEXT_CLAIMABLE = "马上瓜分";              // 可领取时的按钮文字（"马上瓜分今日Q米"）
 var TEXT_CLAIMED = "今日奖励已领取";          // 已领取时的按钮文字
 var TEXT_NOT_ENOUGH = "还差";                 // 步数不足时的按钮文字（"还差6666步就能瓜分Q米，冲鸭 ~"）
-var TEXT_POPUP_CLOSE = "坐等收米";            // 领取成功弹窗的关闭按钮，也用来判断弹窗是否出现（标题"今日已成功瓜分Q米"是图片，控件树里没有）
-var TEXT_AMOUNT_DOT = ".";                    // 领取金额的小数点，单独一个控件，用作定位滚动数字列的基准
+var TEXT_POPUP_CLOSE = "坐等收米";            // 领取成功弹窗里的按钮，用来判断弹窗是否出现（标题"今日已成功瓜分Q米"是图片，控件树里没有）
+var TEXT_MINE_TAB = "我的";                   // 鹅厂运动底部的"我的"标签，Q 米记录页的入口在这一页
+var RE_RECORD_ENTRY = /奖励记录|Q米.*记录/;   // Q 米记录页的入口："我的"页右上角的"奖励记录"、领取弹窗里的"查询Q米瓜分记录"（不能匹配"我的"页的"健康记录"）
+var RE_RECORD_DATE = /\d{4}-\d{2}-\d{2}/;     // Q 米记录页每一行的日期，如"2026-10-16"
+var RE_RECORD_AMOUNT = /^\+?\s*(\d+\.\d+)$/;  // Q 米记录页每一行的数量，如"+0.66"
 
 // 记录各阶段的执行结果，最后统一播报
 var runStatus = [];
@@ -296,6 +301,29 @@ function waitVisibleContaining(pkg, str, timeout) {
     return widget;
 }
 
+// 在指定 App 内查找第一个位于屏幕范围内、文字或描述匹配正则 re 的叶子控件，找不到返回 null
+// 只取叶子控件：WebView 的父容器可能在 desc 里重复带上子控件的文字
+function findVisibleMatching(pkg, re) {
+    var nodes = packageName(pkg).find();
+    for (var i = 0; i < nodes.length; i++) {
+        if (nodes[i].childCount() == 0 && re.test(nodeText(nodes[i])) && isOnScreen(nodes[i])) {
+            return nodes[i];
+        }
+    }
+    return null;
+}
+
+// 在指定时间内等待 findVisibleMatching 找到控件，找不到返回 null
+function waitVisibleMatching(pkg, re, timeout) {
+    var deadline = Date.now() + timeout;
+    var widget = findVisibleMatching(pkg, re);
+    while (!widget && Date.now() < deadline) {
+        sleep(200);
+        widget = findVisibleMatching(pkg, re);
+    }
+    return widget;
+}
+
 // 点击原生界面的控件：优先用无障碍点击，控件不可点击时改为点击坐标中心
 // 小程序页面（WebView 渲染）里的控件不要用它，改用 clickCenter()：WebView 收到无障碍点击后只是转交给页面，
 // 不管页面有没有响应都返回 true，这里就不会退回到坐标点击
@@ -330,6 +358,28 @@ function visibleTexts(pkg) {
 // 判断文字列表中是否有包含 str 的项
 function anyContains(texts, str) {
     return texts.some(function (t) { return t.indexOf(str) >= 0; });
+}
+
+// 判断页面上是否出现了 before（visibleTexts 的结果）里没有的文字，用来确认点击后页面有没有变化
+function hasNewText(pkg, before) {
+    return visibleTexts(pkg).some(function (t) { return before.indexOf(t) < 0; });
+}
+
+// 返回 items（带 cy 字段）中垂直中心离 y 最近的一项，items 为空时返回 null
+function nearestByY(items, y) {
+    var best = null;
+    for (var i = 0; i < items.length; i++) {
+        if (best == null || Math.abs(items[i].cy - y) < Math.abs(best.cy - y)) {
+            best = items[i];
+        }
+    }
+    return best;
+}
+
+// 把日期格式化为"yyyy-MM-dd"，与鹅厂运动 Q 米记录页的日期格式一致
+function formatDate(d) {
+    var pad = function (n) { return (n < 10 ? "0" : "") + n; };
+    return d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-" + pad(d.getDate());
 }
 
 // 收集指定 App 中、垂直方向位于 [top, bottom] 区间内的可见叶子控件文字，按从上到下、从左到右的顺序拼接
@@ -457,85 +507,151 @@ function waitStepsSynced(pkg, timeout) {
     return info;
 }
 
-// 读取领取弹窗中的金额，返回字符串（如 "1.1"、"0.68"），读不到返回 null
-// 金额是滚动数字：每一位是一列竖排的 0–9 TextView，靠上下平移让正确的数字停在显示窗口里，
-// 其余数字只是被遮住，在控件树里仍是"可见"的。所以以小数点为基准，每列取垂直中心最接近小数点中心的那一格，
-// 再从小数点向左、向右分别拼接相邻的列（列间距不超过两个小数点宽度）
-function readOdometer(pkg) {
-    var dot = findVisibleByText(pkg, TEXT_AMOUNT_DOT);
-    if (!dot) {
-        return null;
-    }
-    var db = dot.bounds();
-    var cy = db.centerY();
+// 在 Q 米记录页找出日期为 date（"yyyy-MM-dd"）的那一行，返回这一行的数量（如 "0.66"），找不到返回 null
+// 每一行左边是上下两行字：日期、"领取时间 00:11"，右边是数量"+0.66"，垂直方向落在两行字之间。
+// 取垂直中心离这一行日期最近的数量，再反过来确认离这个数量最近的日期就是这一行，
+// 这样这一行的数量还没显示出来时，不会误取相邻行的数量。
+// 带"+"号的数量优先，避免取到月份标题里的累计数量（"累计获得 20.58Q米"）
+function findRecordAmount(pkg, date) {
     var nodes = packageName(pkg).find();
-    var cols = {};
+    var row = null;
+    var dates = [];
+    var signed = [];
+    var unsigned = [];
     for (var i = 0; i < nodes.length; i++) {
         var n = nodes[i];
-        var t = nodeText(n);
-        if (n.childCount() > 0 || !/^\d$/.test(t)) {
+        if (n.childCount() > 0 || !isOnScreen(n)) {
             continue;
         }
-        var b = n.bounds();
-        if (b.top > cy || b.bottom < cy) {
-            continue;
+        var t = nodeText(n).trim();
+        var item = { cy: n.bounds().centerY(), text: t };
+        if (RE_RECORD_DATE.test(t)) {
+            dates.push(item);
+            if (!row && t.indexOf(date) >= 0) {
+                row = item;
+            }
         }
-        var dist = Math.abs(b.centerY() - cy);
-        if (!cols[b.left] || dist < cols[b.left].dist) {
-            cols[b.left] = { left: b.left, right: b.right, dist: dist, text: t };
+        var m = t.match(RE_RECORD_AMOUNT);
+        if (m) {
+            item.amount = m[1];
+            if (t.charAt(0) == "+") {
+                signed.push(item);
+            } else {
+                unsigned.push(item);
+            }
         }
     }
-    var list = Object.keys(cols).map(function (k) { return cols[k]; });
-    list.sort(function (a, b) { return a.left - b.left; });
-    var maxGap = db.width() * 2;
-    var intPart = "";
-    var edge = db.left;
-    for (var l = list.length - 1; l >= 0; l--) {
-        if (list[l].right > db.left) {
-            continue;
-        }
-        if (edge - list[l].right > maxGap) {
-            break;
-        }
-        intPart = list[l].text + intPart;
-        edge = list[l].left;
+    if (!row) {
+        return null;
     }
-    var fracPart = "";
-    edge = db.right;
-    for (var r = 0; r < list.length; r++) {
-        if (list[r].left < db.right) {
-            continue;
-        }
-        if (list[r].left - edge > maxGap) {
-            break;
-        }
-        fracPart += list[r].text;
-        edge = list[r].right;
+    // 整行文字在同一个控件里时，直接从中提取
+    var inline = row.text.match(/\+\s*(\d+\.\d+)/);
+    if (inline) {
+        log("Q米记录：" + row.text);
+        return inline[1];
     }
-    return intPart !== "" && fracPart !== "" ? intPart + "." + fracPart : null;
+    var best = nearestByY(signed.length ? signed : unsigned, row.cy);
+    if (!best || nearestByY(dates, best.cy) !== row) {
+        return null;
+    }
+    log("Q米记录：" + row.text + " → " + best.text);
+    return best.amount;
 }
 
-// 等待金额滚动动画停稳：每 300 毫秒读一次，读数保持不变满 MP_AMOUNT_STABLE 毫秒才采用
-// 只比较相邻两次不够：动画开始前可能先停在初始位置一小段时间，会被误当成结果。
-// 超时仍未停稳时返回最后一次读数并加"?"，读不到返回 null
-function waitAmountStable(pkg, timeout) {
-    var start = Date.now();
-    var last = null;
-    var since = start;
-    while (true) {
-        var cur = readOdometer(pkg);
-        var now = Date.now();
-        if (cur !== last) {
-            log("领取金额读数（弹窗出现后 " + (now - start) + "ms）：" + cur);
-            last = cur;
-            since = now;
-        } else if (cur != null && now - since >= MP_AMOUNT_STABLE) {
-            return cur;
-        }
-        if (now - start >= timeout) {
-            return last == null ? null : last + "?";
-        }
+// 等待 Q 米记录页显示日期为 date 的那一行，返回数量字符串，超时返回 null
+function waitRecordAmount(pkg, date, timeout) {
+    var deadline = Date.now() + timeout;
+    var amount = findRecordAmount(pkg, date);
+    while (amount == null && Date.now() < deadline) {
         sleep(300);
+        amount = findRecordAmount(pkg, date);
+    }
+    return amount;
+}
+
+// 点击屏幕上的 Q 米记录入口，从记录页读出日期为 date 的那一行的数量，读不到返回 null
+// 点击前先等动画结束，再重新查找入口，用最新的坐标点击。
+// 点击后页面没有任何变化（没有出现新文字），说明点击没生效，重新查找入口再点，最多 MP_RECORD_ATTEMPTS 次；
+// 页面变了就不再点：旧页面的控件可能还留在控件树里，再按它的坐标点，点到的是记录页上的内容
+function openRecordAndRead(pkg, date) {
+    for (var attempt = 1; attempt <= MP_RECORD_ATTEMPTS; attempt++) {
+        sleep(MP_SETTLE_DELAY);
+        var entry = findVisibleMatching(pkg, RE_RECORD_ENTRY);
+        if (!entry) {
+            break;
+        }
+        var before = visibleTexts(pkg);
+        log("点击「" + nodeText(entry) + "」打开 Q 米记录页");
+        clickCenter(entry);
+        var amount = waitRecordAmount(pkg, date, MP_RECORD_TIMEOUT);
+        if (amount != null || hasNewText(pkg, before)) {
+            if (amount == null) {
+                log("Q 米记录页中没有找到 " + date + " 的记录");
+            }
+            debugDump("鹅厂运动 Q 米记录页", pkg);
+            return amount;
+        }
+        log("第 " + attempt + " 次点击 Q 米记录入口后页面没有变化");
+    }
+    debugDump("鹅厂运动（未能打开 Q 米记录页）", pkg);
+    return null;
+}
+
+// 关闭领取弹窗：点"坐等收米"，等它从控件树里消失
+// 领取后先关弹窗，再走和"今日奖励已领取"时相同的路线去读记录：这条路线当天就能反复测，
+// 弹窗里的"查询Q米瓜分记录"只在领取时出现，每天只能测一次。弹窗没关掉时，readTodayAmount() 会改用这个链接
+function closeClaimPopup(pkg) {
+    sleep(MP_SETTLE_DELAY); // 弹窗有入场动画，等它结束再点
+    var btn = findVisibleContaining(pkg, TEXT_POPUP_CLOSE);
+    if (btn) {
+        clickCenter(btn);
+    }
+    var deadline = Date.now() + MP_STEP_TIMEOUT;
+    while (findVisibleContaining(pkg, TEXT_POPUP_CLOSE) && Date.now() < deadline) {
+        sleep(200);
+    }
+    log(findVisibleContaining(pkg, TEXT_POPUP_CLOSE) ? "领取弹窗没有关闭" : "已关闭领取弹窗");
+}
+
+// 切到底部"我的"标签页，等 Q 米记录入口（右上角"奖励记录"）出现，返回入口控件，找不到返回 null
+// 入口没出现就重新点标签，最多 MP_RECORD_ATTEMPTS 次：刚关掉的弹窗如果还挡着，第一次点击会被它吃掉
+function openMineTab(pkg) {
+    for (var attempt = 1; attempt <= MP_RECORD_ATTEMPTS; attempt++) {
+        var tab = findVisibleByText(pkg, TEXT_MINE_TAB);
+        if (!tab) {
+            return null;
+        }
+        log("点击「" + TEXT_MINE_TAB + "」标签，查找 Q 米记录入口");
+        clickCenter(tab);
+        var entry = waitVisibleMatching(pkg, RE_RECORD_ENTRY, MP_STEP_TIMEOUT);
+        if (entry) {
+            return entry;
+        }
+    }
+    return null;
+}
+
+// 读出今天领取的 Q 米数量，返回数量字符串，读不到返回 null
+// 不读领取弹窗里的金额：它是滚动数字动画，控件树里的坐标停在动画中途，读出来的数不对（见 pitfalls.md 第 21 条）。
+// 改为打开 Q 米记录页，读今天这一行。入口是"我的"页右上角的"奖励记录"；
+// 领取弹窗没能关掉时，它挡住了底部标签，改用弹窗里的"查询Q米瓜分记录"
+// 出错时只记日志、返回 null：这时奖励已经领到了，不能让异常把结果报成"执行异常"
+function readTodayAmount(pkg) {
+    try {
+        var date = formatDate(new Date());
+        var entry = findVisibleMatching(pkg, RE_RECORD_ENTRY);
+        if (!entry) {
+            entry = openMineTab(pkg);
+        }
+        if (!entry) {
+            log("未找到 Q 米记录入口");
+            debugDump("鹅厂运动（未找到 Q 米记录入口）", pkg);
+            return null;
+        }
+        return openRecordAndRead(pkg, date);
+    } catch (e) {
+        log("读取 Q 米记录出错：" + e);
+        return null;
     }
 }
 
@@ -585,19 +701,6 @@ function claimReward(pkg, button) {
         button = state.node;
     }
     return null;
-}
-
-// 领取弹窗出现后，读出领取的 Q 米数量，然后关闭弹窗；返回数量字符串，读不到返回 null
-function readClaimedAmount(pkg) {
-    debugDump("鹅厂运动领取弹窗（刚出现）", pkg);
-    var amount = waitAmountStable(pkg, MP_AMOUNT_TIMEOUT);
-    debugDump("鹅厂运动领取弹窗（读数后）", pkg);
-    // 弹窗有缩放动画，开始等到的控件坐标可能已过时，点击前重新查找
-    var closeBtn = findVisibleContaining(pkg, TEXT_POPUP_CLOSE);
-    if (closeBtn) {
-        clickCenter(closeBtn);
-    }
-    return amount;
 }
 
 // 让微信拉出小程序面板，成功返回 true
@@ -796,12 +899,20 @@ try {
         if (!stateBtn) {
             reportStage("⚠️ 鹅厂运动：未识别到领取按钮（" + stepsDesc + "）");
         } else if (stateBtn.state == "claimed") {
-            reportStage("ℹ️ 鹅厂运动：今日奖励已领取（" + stepsDesc + "）");
+            var claimedAmount = readTodayAmount(wechatPkg);
+            if (claimedAmount != null) {
+                reportStage("ℹ️ 鹅厂运动：今日已领取 " + claimedAmount + " Q米（" + stepsDesc + "）");
+            } else {
+                reportStage("ℹ️ 鹅厂运动：今日奖励已领取（" + stepsDesc + "）");
+            }
         } else if (stateBtn.state == "notEnough") {
             reportStage("❌ 鹅厂运动：步数未达标（" + stepsDesc + "）");
         } else {
             var claim = claimReward(wechatPkg, stateBtn.node);
-            var amount = claim == "popup" ? readClaimedAmount(wechatPkg) : null;
+            if (claim == "popup") {
+                closeClaimPopup(wechatPkg);
+            }
+            var amount = claim != null ? readTodayAmount(wechatPkg) : null;
             if (amount != null) {
                 reportStage("✅ 鹅厂运动：领取 " + amount + " Q米（" + stepsDesc + "）");
             } else if (claim != null) {
