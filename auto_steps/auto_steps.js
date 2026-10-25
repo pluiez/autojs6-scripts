@@ -20,6 +20,8 @@ var STEPS_MAX = 10000;           // 随机步数上限（AutoTasks 手动刷步�
 var LAUNCH_TIMEOUT = 10000;      // 等待 App 打开并显示界面的最长时间（毫秒）
 var DIALOG_TIMEOUT = 3000;       // 等待 AutoTasks 手动刷步弹窗出现的最长时间
 var TOAST_TIMEOUT = 2000;        // 点击"开始刷步"后等待结果 toast 的最长时间
+var MP_ENTER_TIMEOUT = 5000;     // 点击鹅厂运动后等待进入小程序界面的最长时间，超时说明点错了地方（例如点进了聊天）
+var MP_OPEN_ATTEMPTS = 2;        // 点击鹅厂运动后没有进入小程序时，最多尝试几次（每次退回首页重新下拉）
 var MP_LOAD_TIMEOUT = 15000;     // 点击鹅厂运动后等待页面加载（"今日步数"出现）的最长时间，超时算打开失败
 var MP_SYNC_TIMEOUT = 30000;     // 等待步数同步到可以领取的最长时间，等满仍没达标才判定步数未达标
 var MP_REFRESH_INTERVAL = 10000; // 等待步数同步期间，步数还没达标时每隔多久点一次"刷新"
@@ -736,21 +738,30 @@ function claimReward(pkg, button) {
 
 // 让微信拉出小程序面板，成功返回 true
 // 微信不再被强制停止，打开时会停留在上次离开的界面，所以每次先判断当前状态再操作
+// 面板收起时，它的控件（搜索栏、小程序图标）仍在控件树里，坐标也在屏幕内，只是压在聊天列表下面，
+// 所以首页标签栏可见时，只有刚执行过下拉，才把看到的搜索栏当作面板已展开（见 pitfalls.md 第 24 条）
 function openMpDrawer(pkg) {
     var w = device.width;
     var h = device.height;
-    for (var attempt = 0; attempt < 3; attempt++) {
-        if (findVisibleByText(pkg, TEXT_MP_SEARCH)) {
+    var pulled = false;
+    for (var attempt = 0; ; attempt++) {
+        var onHome = findVisibleByText(pkg, TEXT_CONTACTS_TAB) != null;
+        if (findVisibleByText(pkg, TEXT_MP_SEARCH) && (!onHome || pulled)) {
             return true; // 小程序面板已展开
         }
-        if (findVisibleByText(pkg, TEXT_CONTACTS_TAB)) {
+        if (attempt >= 3) {
+            return false;
+        }
+        if (onHome) {
             // 底部标签栏可见，说明在微信首页，下拉打开小程序面板
             log("执行下拉手势...");
             gesture(400, [w / 2, h * 0.5], [w / 2, h * 0.85]);
+            pulled = true;
         } else {
             // 停在聊天、公众号等子页面，按返回键退回首页
             log("不在微信首页，按返回键");
             back();
+            pulled = false;
         }
         sleep(1000);
         if (currentPackage() != pkg) {
@@ -758,9 +769,22 @@ function openMpDrawer(pkg) {
             app.launch(pkg);
             waitForApp(pkg, LAUNCH_TIMEOUT);
             sleep(1000);
+            pulled = false;
         }
     }
-    return findVisibleByText(pkg, TEXT_MP_SEARCH) != null;
+}
+
+// 等待进入小程序界面（AppBrandUI 等 plugin.appbrand 下的界面），进入了返回 true
+// 点击小程序图标后，如果当前界面一直不是小程序，说明点到了别的地方（例如面板没展开，点进了聊天）
+function waitEnterMiniProgram(timeout) {
+    var deadline = Date.now() + timeout;
+    while (Date.now() < deadline) {
+        if (String(currentActivity()).toLowerCase().indexOf("appbrand") >= 0) {
+            return true;
+        }
+        sleep(200);
+    }
+    return false;
 }
 
 // 在微信当前界面查找小程序入口控件（排除输入框、屏幕外和顶部区域的控件）
@@ -872,9 +896,36 @@ function stepOpenMiniProgram() {
     }
     sleep(1000); // 等待微信界面渲染完成
 
+    for (var attempt = 1; ; attempt++) {
+        var result = clickMiniProgramEntry(pkg);
+        if (result !== true) {
+            return failStep("❌ 打开鹅厂运动失败：" + result);
+        }
+        if (waitEnterMiniProgram(MP_ENTER_TIMEOUT)) {
+            break;
+        }
+        log("第 " + attempt + " 次点击" + MP_NAME + "后没有进入小程序，当前界面：" + currentActivity());
+        debugDump("微信（点击" + MP_NAME + "后没有进入小程序）", pkg);
+        if (attempt >= MP_OPEN_ATTEMPTS) {
+            return failStep("❌ 打开鹅厂运动失败：点击后没有进入小程序（当前界面 " + currentActivity() + "）");
+        }
+        back(); // 退出点错进入的页面，下一轮由 openMpDrawer() 回到首页重新下拉
+        sleep(1000);
+    }
+
+    log("已点击" + MP_NAME + "，等待页面加载");
+    if (!waitVisibleContaining(pkg, TEXT_STEPS_ANCHOR, MP_LOAD_TIMEOUT)) {
+        debugDump("鹅厂运动（页面没有加载出来）", pkg);
+        return failStep("❌ 打开鹅厂运动失败：" + MP_LOAD_TIMEOUT / 1000 + " 秒内页面没有加载出来");
+    }
+    return true;
+}
+
+// 拉出小程序面板，点击鹅厂运动（常用列表里没有就搜索）。点击了返回 true，否则返回失败原因
+function clickMiniProgramEntry(pkg) {
     if (!openMpDrawer(pkg)) {
         debugDump("微信（未能拉出小程序面板）", pkg);
-        return failStep("❌ 打开鹅厂运动失败：拉不出小程序面板");
+        return "拉不出小程序面板";
     }
     log("扫描小程序：" + MP_NAME);
     var target = findTargetMpWidget(pkg, MP_NAME);
@@ -884,30 +935,24 @@ function stepOpenMiniProgram() {
         log("常用列表未发现目标，启动搜索兜底...");
         var searchBtn = findVisibleByText(pkg, TEXT_MP_SEARCH);
         if (!searchBtn) {
-            return failStep("❌ 打开鹅厂运动失败：找不到小程序搜索栏");
+            return "找不到小程序搜索栏";
         }
         clickCenter(searchBtn);
         sleep(1000);
         var input = className("android.widget.EditText").packageName(pkg).findOne(2000);
         if (!input) {
-            return failStep("❌ 打开鹅厂运动失败：找不到搜索输入框");
+            return "找不到搜索输入框";
         }
         input.setText(MP_NAME);
         sleep(1500);
         target = findTargetMpWidget(pkg, MP_NAME);
         if (!target) {
             debugDump("微信小程序搜索结果（未找到" + MP_NAME + "）", pkg);
-            return failStep("❌ 打开鹅厂运动失败：搜索结果里没有这个小程序");
+            return "搜索结果里没有这个小程序";
         }
         log("通过搜索成功找到并点击！");
     }
     clickCenter(target);
-
-    log("已点击" + MP_NAME + "，等待页面加载");
-    if (!waitVisibleContaining(pkg, TEXT_STEPS_ANCHOR, MP_LOAD_TIMEOUT)) {
-        debugDump("鹅厂运动（页面没有加载出来）", pkg);
-        return failStep("❌ 打开鹅厂运动失败：" + MP_LOAD_TIMEOUT / 1000 + " 秒内页面没有加载出来");
-    }
     return true;
 }
 
